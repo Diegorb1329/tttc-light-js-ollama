@@ -17,6 +17,7 @@ import json
 from json import JSONDecodeError
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List
@@ -26,6 +27,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header
 from openai import OpenAI
 from pydantic import BaseModel
+
+# Importar adaptador Ollama
+from ollama_openai_adapter import create_client
+import ollama_config
 
 
 
@@ -38,6 +43,105 @@ from utils import cute_print, full_speaker_map, token_cost, topic_desc_map, comm
 load_dotenv()
 
 app = FastAPI()
+
+
+def extract_json_from_response(content: str) -> dict:
+    """
+    Extraer JSON válido de la respuesta del modelo, manejando contenido con <think> tags
+    """
+    if not content or not isinstance(content, str):
+        raise ValueError("Contenido vacío o inválido")
+    
+    # Limpiar contenido
+    content = content.strip()
+    
+    # Caso 1: Intentar parsear directamente como JSON
+    try:
+        return json.loads(content)
+    except JSONDecodeError:
+        pass
+    
+    # Caso 2: Buscar JSON después de tags <think>
+    # Patrón para encontrar </think> seguido de JSON
+    think_pattern = r'</think>\s*(\{.*\})'
+    match = re.search(think_pattern, content, re.DOTALL)
+    if match:
+        json_content = match.group(1).strip()
+        try:
+            return json.loads(json_content)
+        except JSONDecodeError:
+            pass
+    
+    # Caso 3: Buscar cualquier estructura JSON que contenga "taxonomy"
+    # Patrón más flexible para encontrar JSON con "taxonomy"
+    json_pattern = r'(\{"taxonomy".*?\}\s*\]?\s*\})'
+    match = re.search(json_pattern, content, re.DOTALL)
+    if match:
+        json_content = match.group(1).strip()
+        # Asegurar que termine correctamente
+        if not json_content.endswith('}'):
+            json_content += '}'
+        try:
+            return json.loads(json_content)
+        except JSONDecodeError:
+            pass
+    
+    # Caso 4: Buscar JSON en cualquier parte del contenido
+    # Patrón para encontrar cualquier objeto JSON válido
+    general_json_pattern = r'(\{[^{}]*"taxonomy"[^{}]*\{.*?\}\s*\]?\s*\})'
+    match = re.search(general_json_pattern, content, re.DOTALL)
+    if match:
+        json_content = match.group(1).strip()
+        try:
+            return json.loads(json_content)
+        except JSONDecodeError:
+            pass
+    
+    # Si todo falla, lanzar excepción con información útil
+    raise ValueError(f"No se pudo extraer JSON válido del contenido. Contenido: {content[:200]}...")
+
+
+def get_model_name(model_name: str) -> str:
+    """
+    Obtener el nombre del modelo correcto según la configuración
+    """
+    if ollama_config.should_use_ollama():
+        return ollama_config.get_ollama_model(model_name)
+    else:
+        return model_name
+
+
+def create_llm_client(api_key: str = None):
+    """
+    Crear cliente LLM según la configuración
+    """
+    if ollama_config.should_use_ollama():
+        return create_client(
+            base_url=ollama_config.OLLAMA_BASE_URL,
+            model=ollama_config.OLLAMA_DEFAULT_MODEL
+        )
+    else:
+        return OpenAI(api_key=api_key)
+
+
+def get_llm_client(api_key: str = None, model_name: str = None):
+    """
+    Obtener cliente LLM (OpenAI o Ollama) basado en configuración
+    """
+    if ollama_config.should_use_ollama():
+        # Usar Ollama con modelo mapeado
+        ollama_model = ollama_config.get_ollama_model(model_name) if model_name else ollama_config.OLLAMA_DEFAULT_MODEL
+        client = create_client(
+            base_url=ollama_config.OLLAMA_BASE_URL,
+            model=ollama_model
+        )
+        print(f"🦙 Usando Ollama: {ollama_model}")
+        return client, ollama_model
+    else:
+        # Usar OpenAI original
+        client = OpenAI(api_key=api_key)
+        print(f"🤖 Usando OpenAI: {model_name}")
+        return client, model_name
 
 class Comment(BaseModel):
     id: str
@@ -175,8 +279,9 @@ def comments_to_tree(
     if dry_run or config.DRY_RUN:
         print("dry_run topic tree")
         return config.MOCK_RESPONSE["topic_tree"]
-    # api_key = req.llm.api_key
-    client = OpenAI(api_key=x_openai_api_key)
+    
+    # Obtener cliente LLM (OpenAI o Ollama)
+    client, actual_model = get_llm_client(x_openai_api_key, req.llm.model_name)
 
     # append comments to prompt
     full_prompt = req.llm.user_prompt
@@ -187,19 +292,42 @@ def comments_to_tree(
         else:
             print("warning:empty comment in topic_tree:" + comment.text)
 
-    response = client.chat.completions.create(
-        model=req.llm.model_name,
-        messages=[
-            {"role": "system", "content": req.llm.system_prompt},
+    # Para Ollama, modificar prompts para asegurar salida JSON
+    system_prompt = req.llm.system_prompt
+    if ollama_config.should_use_ollama():
+        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
+        full_prompt += "\n\nRespond with valid JSON in this exact structure: {\"taxonomy\": [{\"topicName\": \"...\", \"topicShortDescription\": \"...\", \"subtopics\": [{\"subtopicName\": \"...\", \"subtopicShortDescription\": \"...\"}]}]}"
+
+    # Preparar argumentos para la llamada
+    call_args = {
+        "model": actual_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.0,
+    }
+    
+    # Configuraciones específicas según el backend
+    if ollama_config.should_use_ollama():
+        # Para Ollama: deshabilitar thinking
+        call_args["think"] = False
+    else:
+        # Para OpenAI: usar response_format JSON
+        call_args["response_format"] = {"type": "json_object"}
+    
+    response = client.chat.completions.create(**call_args)
     try:
-        tree = json.loads(response.choices[0].message.content)
-    except Exception:
+        content = response.choices[0].message.content
+        print(f"Raw response content: {content[:500]}...")  # Log para debug
+        
+        # Usar la función de extracción mejorada
+        tree = extract_json_from_response(content)
+        print(f"Successfully parsed JSON: {tree}")
+            
+    except Exception as e:
         print("Step 1: no topic tree: ", response)
+        print("Parse error:", str(e))
         tree = {}
     usage = response.usage
     # compute LLM costs for this step's tokens
@@ -258,7 +386,7 @@ def comments_to_tree(
     }
 
 
-def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict:
+def comment_to_claims(llm: LLMConfig, comment: str, tree: dict, api_key: str) -> dict:
     """Given a comment and the full taxonomy/topic tree for the report, extract one or more claims from the comment.
     
     Args:
@@ -270,7 +398,8 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
     Returns:
         dict: A dictionary containing the extracted claims and usage information.
     """
-    client = OpenAI(api_key=api_key)
+    # Obtener cliente LLM (OpenAI o Ollama)
+    client, actual_model = get_llm_client(api_key, llm.model_name)
 
     # add taxonomy and comment to prompt template
     taxonomy_string = json.dumps(tree)
@@ -281,29 +410,43 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
         "\n" + taxonomy_string + "\nAnd then here is the comment:\n" + comment
     )
 
-    response = client.chat.completions.create(
-        model=llm.model_name,
-        messages=[
+    # Para Ollama, modificar prompts para asegurar salida JSON
+    system_prompt = llm.system_prompt
+    if ollama_config.should_use_ollama():
+        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
+        full_prompt += "\n\nRespond with valid JSON containing the extracted claims."
+
+    # Preparar argumentos para la llamada
+    call_args = {
+        "model": actual_model,
+        "messages": [
             {
                 "role": "system",
-                "content": llm.system_prompt,
+                "content": system_prompt,
             },
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.0,
+    }
+    
+    # Solo agregar response_format para OpenAI (Ollama no lo soporta nativamente)
+    if not ollama_config.should_use_ollama():
+        call_args["response_format"] = {"type": "json_object"}
+    
+    response = client.chat.completions.create(**call_args)
     try:
-        claims = response.choices[0].message.content
-    except Exception:
+        content = response.choices[0].message.content
+        print(f"Raw claims response: {content[:200]}...")  # Log para debug
+        
+        # Usar la función de extracción mejorada para claims también
+        claims_obj = extract_json_from_response(content)
+        print(f"Successfully parsed claims JSON: {claims_obj}")
+        
+    except Exception as e:
         print("Step 2: no response: ", response)
-        claims = {}
-    # TODO: json.loads(claims) fails sometimes
-    try:
-        claims_obj = json.loads(claims)
-    except JSONDecodeError:
-        print("json_parse_failure;claims:", claims)
-        claims_obj = claims
+        print("Claims parse error:", str(e))
+        claims_obj = {"claims": []}  # Estructura por defecto para claims
+        
     return {"claims": claims_obj, "usage": response.usage}
 
 
@@ -590,22 +733,35 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
     Returns:  
         dict: A dictionary containing the deduplicated claims and usage information.  
     """
-    client = OpenAI(api_key=api_key)
+    # Obtener cliente LLM (OpenAI o Ollama)
+    client, actual_model = get_llm_client(api_key, llm.model_name)
 
     # add claims with enumerated ids (relative to this subtopic only)
     full_prompt = llm.user_prompt
     for i, orig_claim in enumerate(claims):
         full_prompt += "\nclaimId" + str(i) + ": " + orig_claim["claim"]
 
-    response = client.chat.completions.create(
-        model=config.MODEL,
-        messages=[
-            {"role": "system", "content": llm.system_prompt},
+    # Para Ollama, modificar prompts para asegurar salida JSON
+    system_prompt = llm.system_prompt
+    if ollama_config.should_use_ollama():
+        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
+        full_prompt += "\n\nRespond with valid JSON containing the deduplicated claims."
+
+    # Preparar argumentos para la llamada
+    call_args = {
+        "model": actual_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.0,
+    }
+    
+    # Solo agregar response_format para OpenAI (Ollama no lo soporta nativamente)
+    if not ollama_config.should_use_ollama():
+        call_args["response_format"] = {"type": "json_object"}
+    
+    response = client.chat.completions.create(**call_args)
     try:
         deduped_claims = response.choices[0].message.content
     except Exception:
@@ -1113,14 +1269,16 @@ def controversy_matrix(cont_mat: list) -> list:
 
 
 def cruxes_for_topic(
-    llm: dict, topic: str, topic_desc: str, claims: list, speaker_map: dict, api_key: str
+    llm: LLMConfig, topic: str, topic_desc: str, claims: list, speaker_map: dict, api_key: str
 ) -> dict:
     """For each fully-described subtopic, provide all the relevant claims with an anonymized
     numeric speaker id, and ask the LLM for a crux claim that best splits the speakers' opinions
     on this topic (ideally into two groups of equal size for agreement vs disagreement with the crux claim).
     Requires an explicit API key in api_key.
     """
-    client = OpenAI(api_key=api_key)
+    # Obtener cliente LLM (OpenAI o Ollama)
+    client, actual_model = get_llm_client(api_key, llm.model_name)
+    
     claims_anon = []
     speaker_set = set()
     for claim in claims:
@@ -1139,20 +1297,39 @@ def cruxes_for_topic(
     full_prompt += "\nTopic: " + topic + ": " + topic_desc
     full_prompt += "\nParticipant claims: \n" + json.dumps(claims_anon)
 
-    response = client.chat.completions.create(
-        model=llm.model_name,
-        messages=[
-            {"role": "system", "content": llm.system_prompt},
+    # Para Ollama, modificar prompts para asegurar salida JSON
+    system_prompt = llm.system_prompt
+    if ollama_config.should_use_ollama():
+        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
+        full_prompt += "\n\nRespond with valid JSON containing the crux analysis."
+
+    # Preparar argumentos para la llamada
+    call_args = {
+        "model": actual_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
-    crux = response.choices[0].message.content
+        "temperature": 0.0,
+    }
+    
+    # Solo agregar response_format para OpenAI (Ollama no lo soporta nativamente)
+    if not ollama_config.should_use_ollama():
+        call_args["response_format"] = {"type": "json_object"}
+    
+    response = client.chat.completions.create(**call_args)
     try:
-        crux_obj = json.loads(crux)
-    except JSONDecodeError:
-        crux_obj = crux
+        content = response.choices[0].message.content
+        print(f"Raw crux response: {content[:200]}...")  # Log para debug
+        
+        # Usar la función de extracción mejorada para cruxes también
+        crux_obj = extract_json_from_response(content)
+        print(f"Successfully parsed crux JSON: {crux_obj}")
+        
+    except Exception as e:
+        print("Crux parse error:", str(e))
+        crux_obj = {"crux": "Error parsing response"}  # Estructura por defecto para cruxes
+        
     return {"crux": crux_obj, "usage": response.usage}
 
 

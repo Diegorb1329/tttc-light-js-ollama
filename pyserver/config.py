@@ -7,6 +7,19 @@
 # which would typically call OpenAI
 DRY_RUN = False
 
+# Configuración Ollama
+USE_OLLAMA = True  # Cambiar a True para usar Ollama por defecto
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_DEFAULT_MODEL = "qwen3:8b"
+
+# Mapeo de modelos OpenAI a Ollama
+MODEL_MAPPING = {
+    "gpt-4o-mini": "qwen3:8b",
+    "gpt-4-turbo-preview": "qwen3:8b", 
+    "gpt-4o": "qwen3:8b",
+    "gpt-3.5-turbo": "qwen3:8b",
+}
+
 # cheapest for testing
 MODEL = "gpt-4o-mini"  # prod default: "gpt-4-turbo-preview"
 
