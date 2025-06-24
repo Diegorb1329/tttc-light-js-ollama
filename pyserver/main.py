@@ -18,6 +18,7 @@ from json import JSONDecodeError
 import math
 import os
 import sys
+import re
 from pathlib import Path
 from typing import List
 
@@ -28,6 +29,57 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 
+def extract_json_from_response(response_content: str) -> dict:
+    """
+    Extract valid JSON from LLM response that may contain <think> tags or other non-JSON content.
+    
+    Args:
+        response_content (str): The raw response content from LLM
+        
+    Returns:
+        dict: Parsed JSON object
+        
+    Raises:
+        JSONDecodeError: If no valid JSON is found
+    """
+    if not response_content:
+        raise JSONDecodeError("Empty response content", "", 0)
+    
+    # First, try to parse as-is (for responses that are pure JSON)
+    try:
+        return json.loads(response_content)
+    except JSONDecodeError:
+        pass
+    
+    # If that fails, try to extract JSON from responses with <think> tags
+    # Look for JSON content after </think> tag
+    think_pattern = r'</think>\s*({.*})\s*$'
+    match = re.search(think_pattern, response_content, re.DOTALL)
+    
+    if match:
+        json_content = match.group(1)
+        try:
+            return json.loads(json_content)
+        except JSONDecodeError:
+            pass
+    
+    # Try to find any JSON object in the response (fallback)
+    json_pattern = r'({.*})'
+    matches = re.findall(json_pattern, response_content, re.DOTALL)
+    
+    for match in matches:
+        try:
+            return json.loads(match)
+        except JSONDecodeError:
+            continue
+    
+    # If no valid JSON found, raise error with helpful message
+    raise JSONDecodeError(
+        f"No valid JSON found in response. Content preview: {response_content[:200]}...", 
+        response_content, 
+        0
+    )
+
 
 # Add the current directory to path for imports
 current_dir = Path(__file__).resolve().parent
@@ -35,9 +87,39 @@ sys.path.append(str(current_dir))
 import config
 from utils import cute_print, full_speaker_map, token_cost, topic_desc_map, comment_is_meaningful
 
+# Importar adaptador de Ollama si se requiere
+if config.USE_OLLAMA:
+    from ollama_openai_adapter import OpenAICompatibleClient
+
 load_dotenv()
 
 app = FastAPI()
+
+
+def create_llm_client(api_key: str):
+    """
+    Crear cliente LLM basado en configuración.
+    Retorna cliente OpenAI estándar o adaptador de Ollama.
+    """
+    if config.USE_OLLAMA:
+        print(f"🦙 Usando Ollama: {config.OLLAMA_BASE_URL} con modelo {config.OLLAMA_DEFAULT_MODEL}")
+        return OpenAICompatibleClient(
+            base_url=config.OLLAMA_BASE_URL,
+            default_model=config.OLLAMA_DEFAULT_MODEL,
+            api_key=api_key
+        )
+    else:
+        print(f"🤖 Usando OpenAI con modelo {config.MODEL}")
+        return OpenAI(api_key=api_key)
+
+
+def get_model_name(requested_model: str) -> str:
+    """
+    Mapear nombre de modelo de OpenAI a modelo Ollama si es necesario.
+    """
+    if config.USE_OLLAMA and requested_model in config.MODEL_MAPPING:
+        return config.MODEL_MAPPING[requested_model]
+    return requested_model
 
 class Comment(BaseModel):
     id: str
@@ -176,7 +258,7 @@ def comments_to_tree(
         print("dry_run topic tree")
         return config.MOCK_RESPONSE["topic_tree"]
     # api_key = req.llm.api_key
-    client = OpenAI(api_key=x_openai_api_key)
+    client = create_llm_client(x_openai_api_key)
 
     # append comments to prompt
     full_prompt = req.llm.user_prompt
@@ -188,7 +270,7 @@ def comments_to_tree(
             print("warning:empty comment in topic_tree:" + comment.text)
 
     response = client.chat.completions.create(
-        model=req.llm.model_name,
+        model=get_model_name(req.llm.model_name),
         messages=[
             {"role": "system", "content": req.llm.system_prompt},
             {"role": "user", "content": full_prompt},
@@ -197,9 +279,10 @@ def comments_to_tree(
         response_format={"type": "json_object"},
     )
     try:
-        tree = json.loads(response.choices[0].message.content)
-    except Exception:
+        tree = extract_json_from_response(response.choices[0].message.content)
+    except Exception as e:
         print("Step 1: no topic tree: ", response)
+        print(f"JSON parsing error: {str(e)}")
         tree = {}
     usage = response.usage
     # compute LLM costs for this step's tokens
@@ -270,7 +353,7 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
     Returns:
         dict: A dictionary containing the extracted claims and usage information.
     """
-    client = OpenAI(api_key=api_key)
+    client = create_llm_client(api_key)
 
     # add taxonomy and comment to prompt template
     taxonomy_string = json.dumps(tree)
@@ -282,7 +365,7 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
     )
 
     response = client.chat.completions.create(
-        model=llm.model_name,
+        model=get_model_name(llm.model_name),
         messages=[
             {
                 "role": "system",
@@ -298,11 +381,12 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
     except Exception:
         print("Step 2: no response: ", response)
         claims = {}
-    # TODO: json.loads(claims) fails sometimes
+    # Using robust JSON parsing for claims
     try:
-        claims_obj = json.loads(claims)
-    except JSONDecodeError:
+        claims_obj = extract_json_from_response(claims)
+    except JSONDecodeError as e:
         print("json_parse_failure;claims:", claims)
+        print(f"JSON parsing error: {str(e)}")
         claims_obj = claims
     return {"claims": claims_obj, "usage": response.usage}
 
@@ -590,7 +674,7 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
     Returns:  
         dict: A dictionary containing the deduplicated claims and usage information.  
     """
-    client = OpenAI(api_key=api_key)
+    client = create_llm_client(api_key)
 
     # add claims with enumerated ids (relative to this subtopic only)
     full_prompt = llm.user_prompt
@@ -598,7 +682,7 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
         full_prompt += "\nclaimId" + str(i) + ": " + orig_claim["claim"]
 
     response = client.chat.completions.create(
-        model=config.MODEL,
+        model=get_model_name(config.MODEL),
         messages=[
             {"role": "system", "content": llm.system_prompt},
             {"role": "user", "content": full_prompt},
@@ -612,9 +696,10 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
         print("Step 3: no deduped claims: ", response)
         deduped_claims = {}
     try:
-        deduped_claims_obj = json.loads(deduped_claims)
-    except JSONDecodeError:
+        deduped_claims_obj = extract_json_from_response(deduped_claims)
+    except JSONDecodeError as e:
         print("json failure;dedup:", deduped_claims)
+        print(f"JSON parsing error: {str(e)}")
         deduped_claims_obj = deduped_claims
     return {"dedup_claims": deduped_claims_obj, "usage": response.usage}
 
@@ -877,7 +962,7 @@ def sort_claims_tree(
                     # implementation notes:
                     # - MOST claims should NOT be near-duplicates
                     # - nesting where |claim_vals| > 0 should be a smaller set than |subtopic_data["claims"]|
-                    # - but also we won't have duplicate info bidirectionally — A may be dupe of B, but B not dupe of A
+                    # - but also we won't have duplicate info bidirectionally — A may be dupe of B, but B not dupe of A
                     for claim_key, claim_vals in deduped["nesting"].items():
                         # this claim_key has some duplicates
                         if len(claim_vals) > 0:
@@ -1120,7 +1205,7 @@ def cruxes_for_topic(
     on this topic (ideally into two groups of equal size for agreement vs disagreement with the crux claim).
     Requires an explicit API key in api_key.
     """
-    client = OpenAI(api_key=api_key)
+    client = create_llm_client(api_key)
     claims_anon = []
     speaker_set = set()
     for claim in claims:
@@ -1140,7 +1225,7 @@ def cruxes_for_topic(
     full_prompt += "\nParticipant claims: \n" + json.dumps(claims_anon)
 
     response = client.chat.completions.create(
-        model=llm.model_name,
+        model=get_model_name(llm.model_name),
         messages=[
             {"role": "system", "content": llm.system_prompt},
             {"role": "user", "content": full_prompt},
@@ -1150,8 +1235,9 @@ def cruxes_for_topic(
     )
     crux = response.choices[0].message.content
     try:
-        crux_obj = json.loads(crux)
-    except JSONDecodeError:
+        crux_obj = extract_json_from_response(crux)
+    except JSONDecodeError as e:
+        print(f"JSON parsing error in cruxes: {str(e)}")
         crux_obj = crux
     return {"crux": crux_obj, "usage": response.usage}
 
