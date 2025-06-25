@@ -29,76 +29,27 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 # Importar adaptador Ollama
-from ollama_openai_adapter import create_client
-import ollama_config
+from .ollama_openai_adapter import create_client
+from . import ollama_config
+
+# Importar parser JSON desde tests
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent / "ollama-tests" / "tests" / "phase3_integration"))
+from json_response_parser import extract_json_from_response
 
 
 
 # Add the current directory to path for imports
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
-import config
-from utils import cute_print, full_speaker_map, token_cost, topic_desc_map, comment_is_meaningful
+from . import config
+from .utils import cute_print, full_speaker_map, token_cost, topic_desc_map, comment_is_meaningful
 
 load_dotenv()
 
 app = FastAPI()
 
-
-def extract_json_from_response(content: str) -> dict:
-    """
-    Extraer JSON válido de la respuesta del modelo, manejando contenido con <think> tags
-    """
-    if not content or not isinstance(content, str):
-        raise ValueError("Contenido vacío o inválido")
-    
-    # Limpiar contenido
-    content = content.strip()
-    
-    # Caso 1: Intentar parsear directamente como JSON
-    try:
-        return json.loads(content)
-    except JSONDecodeError:
-        pass
-    
-    # Caso 2: Buscar JSON después de tags <think>
-    # Patrón para encontrar </think> seguido de JSON
-    think_pattern = r'</think>\s*(\{.*\})'
-    match = re.search(think_pattern, content, re.DOTALL)
-    if match:
-        json_content = match.group(1).strip()
-        try:
-            return json.loads(json_content)
-        except JSONDecodeError:
-            pass
-    
-    # Caso 3: Buscar cualquier estructura JSON que contenga "taxonomy"
-    # Patrón más flexible para encontrar JSON con "taxonomy"
-    json_pattern = r'(\{"taxonomy".*?\}\s*\]?\s*\})'
-    match = re.search(json_pattern, content, re.DOTALL)
-    if match:
-        json_content = match.group(1).strip()
-        # Asegurar que termine correctamente
-        if not json_content.endswith('}'):
-            json_content += '}'
-        try:
-            return json.loads(json_content)
-        except JSONDecodeError:
-            pass
-    
-    # Caso 4: Buscar JSON en cualquier parte del contenido
-    # Patrón para encontrar cualquier objeto JSON válido
-    general_json_pattern = r'(\{[^{}]*"taxonomy"[^{}]*\{.*?\}\s*\]?\s*\})'
-    match = re.search(general_json_pattern, content, re.DOTALL)
-    if match:
-        json_content = match.group(1).strip()
-        try:
-            return json.loads(json_content)
-        except JSONDecodeError:
-            pass
-    
-    # Si todo falla, lanzar excepción con información útil
-    raise ValueError(f"No se pudo extraer JSON válido del contenido. Contenido: {content[:200]}...")
 
 
 def get_model_name(model_name: str) -> str:
@@ -295,8 +246,9 @@ def comments_to_tree(
     # Para Ollama, modificar prompts para asegurar salida JSON
     system_prompt = req.llm.system_prompt
     if ollama_config.should_use_ollama():
-        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
-        full_prompt += "\n\nRespond with valid JSON in this exact structure: {\"taxonomy\": [{\"topicName\": \"...\", \"topicShortDescription\": \"...\", \"subtopics\": [{\"subtopicName\": \"...\", \"subtopicShortDescription\": \"...\"}]}]}"
+        # Prompts optimizados para Llama3.2 - más directo y específico
+        system_prompt = "You are a JSON generator. You MUST respond with ONLY valid JSON. No text before or after the JSON. Each topic MUST have at least one subtopic."
+        full_prompt += "\n\n<JSON_OUTPUT_REQUIRED>\nGenerate a JSON taxonomy with this EXACT structure. Every topic MUST include subtopics array:\n{\"taxonomy\": [{\"topicName\": \"Topic Name\", \"topicShortDescription\": \"Description of the topic\", \"subtopics\": [{\"subtopicName\": \"Subtopic Name\", \"subtopicShortDescription\": \"Description of subtopic\"}]}]}\n\nIMPORTANT: Each topic must have at least 1 subtopic in the subtopics array. Do not omit the subtopics field.\n</JSON_OUTPUT_REQUIRED>"
 
     # Preparar argumentos para la llamada
     call_args = {
@@ -323,7 +275,35 @@ def comments_to_tree(
         
         # Usar la función de extracción mejorada
         tree = extract_json_from_response(content)
-        print(f"Successfully parsed JSON: {tree}")
+        
+        # Validar y normalizar estructura completa
+        if not isinstance(tree, dict):
+            print("Warning: Invalid tree structure, creating default")
+            tree = {"taxonomy": []}
+        
+        if "taxonomy" not in tree:
+            print("Warning: No taxonomy field found, creating empty taxonomy")
+            tree["taxonomy"] = []
+        
+        if not isinstance(tree["taxonomy"], list):
+            print("Warning: taxonomy field is not a list, converting to empty list")
+            tree["taxonomy"] = []
+            
+        # Normalizar estructura: asegurar que cada topic tenga subtopics
+        for topic in tree["taxonomy"]:
+            if not isinstance(topic, dict):
+                continue
+                
+            if "subtopics" not in topic or not isinstance(topic["subtopics"], list):
+                # Si no tiene subtopics, crear uno genérico basado en el topic
+                topic_name = topic.get("topicName", "Unknown Topic")
+                topic["subtopics"] = [{
+                    "subtopicName": f"General {topic_name}",
+                    "subtopicShortDescription": f"General aspects of {topic_name.lower()}"
+                }]
+                print(f"Warning: Added default subtopic for topic '{topic_name}'")
+        
+        print(f"Successfully parsed JSON with {len(tree.get('taxonomy', []))} topics")
             
     except Exception as e:
         print("Step 1: no topic tree: ", response)
@@ -349,14 +329,27 @@ def comments_to_tree(
                 },
             )
             comment_lengths = [len(c.text) for c in req.comments]
-            num_topics = len(tree["taxonomy"])
-            subtopic_bins = [len(t["subtopics"]) for t in tree["taxonomy"]]
+            
+            # Manejo seguro de datos de tree para W&B
+            taxonomy = tree.get("taxonomy", [])
+            num_topics = len(taxonomy) if isinstance(taxonomy, list) else 0
+            subtopic_bins = []
+            for t in taxonomy:
+                if isinstance(t, dict) and "subtopics" in t and isinstance(t["subtopics"], list):
+                    subtopic_bins.append(len(t["subtopics"]))
+                else:
+                    subtopic_bins.append(0)
 
             # in case comments are empty / for W&B Table logging
             comment_list = "none"
             if len(req.comments) > 1:
                 comment_list = "\n".join([c.text for c in req.comments])
-            comms_tree_list = [[comment_list, json.dumps(tree["taxonomy"], indent=1)]]
+            
+            try:
+                taxonomy_json = json.dumps(taxonomy, indent=1)
+            except Exception:
+                taxonomy_json = "Error serializing taxonomy"
+            comms_tree_list = [[comment_list, taxonomy_json]]
             wandb.log(
                 {
                     "comm_N": len(req.comments),
@@ -377,10 +370,9 @@ def comments_to_tree(
             )
         except Exception:
             print("Failed to create wandb run")
-    # NOTE:we could return a dictionary with one key "taxonomy", or the raw taxonomy list directly
-    # choosing the latter for now
+    # NOTE: El Express server espera que data sea directamente el array de topics
     return {
-        "data": tree["taxonomy"],
+        "data": tree.get("taxonomy", []),
         "usage": usage.model_dump(),
         "cost": s1_total_cost,
     }
@@ -413,8 +405,9 @@ def comment_to_claims(llm: LLMConfig, comment: str, tree: dict, api_key: str) ->
     # Para Ollama, modificar prompts para asegurar salida JSON
     system_prompt = llm.system_prompt
     if ollama_config.should_use_ollama():
-        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
-        full_prompt += "\n\nRespond with valid JSON containing the extracted claims."
+        # Prompts optimizados para Llama3.2
+        system_prompt = "You are a JSON generator. You MUST respond with ONLY valid JSON. No text before or after the JSON."
+        full_prompt += f"\n\n<JSON_OUTPUT_REQUIRED>\nExtract claims and respond with valid JSON in this EXACT format:\n{{\n  \"claims\": [\n    {{\n      \"claim\": \"string\",\n      \"quote\": \"string\",\n      \"topicName\": \"string\",\n      \"subtopicName\": \"string\"\n    }}\n  ]\n}}\nEnsure ALL claims have topicName and subtopicName fields.\n</JSON_OUTPUT_REQUIRED>"
 
     # Preparar argumentos para la llamada
     call_args = {
@@ -429,8 +422,12 @@ def comment_to_claims(llm: LLMConfig, comment: str, tree: dict, api_key: str) ->
         "temperature": 0.0,
     }
     
-    # Solo agregar response_format para OpenAI (Ollama no lo soporta nativamente)
-    if not ollama_config.should_use_ollama():
+    # Configuraciones específicas según el backend
+    if ollama_config.should_use_ollama():
+        # Para Ollama: deshabilitar thinking para mayor velocidad
+        call_args["think"] = False
+    else:
+        # Para OpenAI: usar response_format JSON
         call_args["response_format"] = {"type": "json_object"}
     
     response = client.chat.completions.create(**call_args)
@@ -440,7 +437,21 @@ def comment_to_claims(llm: LLMConfig, comment: str, tree: dict, api_key: str) ->
         
         # Usar la función de extracción mejorada para claims también
         claims_obj = extract_json_from_response(content)
-        print(f"Successfully parsed claims JSON: {claims_obj}")
+        
+        # Normalizar la estructura de claims - manejar tanto arrays directos como objetos con clave 'claims'
+        if isinstance(claims_obj, list):
+            # Si es un array directo, envolver en objeto
+            claims_obj = {"claims": claims_obj}
+            claims_count = len(claims_obj["claims"])
+        elif isinstance(claims_obj, dict) and "claims" in claims_obj:
+            # Si es un objeto con clave 'claims'
+            claims_count = len(claims_obj["claims"]) if isinstance(claims_obj["claims"], list) else 0
+        else:
+            # Formato inesperado, crear estructura por defecto
+            claims_obj = {"claims": []}
+            claims_count = 0
+            
+        print(f"Successfully parsed claims JSON with {claims_count} claims")
         
     except Exception as e:
         print("Step 2: no response: ", response)
@@ -590,10 +601,15 @@ def all_comments_to_claims(
             continue
         try:
             claims = response["claims"]
+            # Verificar que claims tenga la estructura esperada
+            if not isinstance(claims, dict) or "claims" not in claims:
+                print(f"Unexpected claims structure: {claims}")
+                claims = {"claims": []}
+            
             for claim in claims["claims"]:
                 claim.update({"commentId": comment.id, "speaker": comment.speaker})
-        except Exception:
-            print("Step 2: no claims for comment: ", response)
+        except Exception as e:
+            print(f"Step 2: no claims for comment (error: {str(e)}): ", response)
             claims = None
             continue
         # reference format
@@ -620,7 +636,17 @@ def all_comments_to_claims(
     for claim in comms_to_claims:
         if "topicName" not in claim:
             print("claim unassigned to topic: ", claim)
-            continue
+            # Intentar asignar a un tópico por defecto basado en los tópicos disponibles
+            if req.tree and "taxonomy" in req.tree and len(req.tree["taxonomy"]) > 0:
+                default_topic = req.tree["taxonomy"][0]["topicName"]
+                print(f"Assigning claim to default topic: {default_topic}")
+                claim["topicName"] = default_topic
+                if "subtopics" in req.tree["taxonomy"][0] and len(req.tree["taxonomy"][0]["subtopics"]) > 0:
+                    claim["subtopicName"] = req.tree["taxonomy"][0]["subtopics"][0]["subtopicName"]
+                else:
+                    claim["subtopicName"] = "General"
+            else:
+                continue
         if claim["topicName"] in node_counts:
             node_counts[claim["topicName"]]["total"] += 1
             node_counts[claim["topicName"]]["speakers"].add(claim["speaker"])
@@ -744,8 +770,9 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
     # Para Ollama, modificar prompts para asegurar salida JSON
     system_prompt = llm.system_prompt
     if ollama_config.should_use_ollama():
-        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
-        full_prompt += "\n\nRespond with valid JSON containing the deduplicated claims."
+        # Prompts optimizados para Llama3.1
+        system_prompt = "You are a JSON generator. You MUST respond with ONLY valid JSON. No text before or after the JSON."
+        full_prompt += "\n\n<JSON_OUTPUT_REQUIRED>\nAnalyze duplicates and respond with valid JSON containing the deduplicated claims.\n</JSON_OUTPUT_REQUIRED>"
 
     # Preparar argumentos para la llamada
     call_args = {
@@ -757,21 +784,31 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
         "temperature": 0.0,
     }
     
-    # Solo agregar response_format para OpenAI (Ollama no lo soporta nativamente)
-    if not ollama_config.should_use_ollama():
+    # Configuraciones específicas según el backend
+    if ollama_config.should_use_ollama():
+        # Para Ollama: deshabilitar thinking para mayor velocidad
+        call_args["think"] = False
+    else:
+        # Para OpenAI: usar response_format JSON
         call_args["response_format"] = {"type": "json_object"}
     
     response = client.chat.completions.create(**call_args)
     try:
-        deduped_claims = response.choices[0].message.content
-    except Exception:
+        content = response.choices[0].message.content
+        print(f"Raw dedup response: {content[:200]}...")  # Log para debug
+        
+        # Usar la función de extracción mejorada para dedup también
+        deduped_claims_obj = extract_json_from_response(content)
+        # Verificar estructura básica para dedup
+        if not isinstance(deduped_claims_obj, dict):
+            print(f"Unexpected dedup structure: {deduped_claims_obj}")
+            deduped_claims_obj = {"nesting": {}}
+        print(f"Successfully parsed dedup JSON with keys: {list(deduped_claims_obj.keys())}")
+        
+    except Exception as e:
         print("Step 3: no deduped claims: ", response)
-        deduped_claims = {}
-    try:
-        deduped_claims_obj = json.loads(deduped_claims)
-    except JSONDecodeError:
-        print("json failure;dedup:", deduped_claims)
-        deduped_claims_obj = deduped_claims
+        print("Dedup parse error:", str(e))
+        deduped_claims_obj = {"nesting": {}}  # Estructura por defecto para dedup
     return {"dedup_claims": deduped_claims_obj, "usage": response.usage}
 
 
@@ -991,6 +1028,7 @@ def sort_claims_tree(
     if dry_run or config.DRY_RUN:
        print("dry_run sort tree")
        return config.MOCK_RESPONSE["sort_claims_tree"]
+       
     claims_tree = req.tree
     llm = req.llm
     TK_IN = 0
@@ -998,6 +1036,11 @@ def sort_claims_tree(
     TK_TOT = 0
     dupe_logs = []
     sorted_tree = {}
+    
+    # Validar estructura de entrada
+    if not isinstance(claims_tree, dict):
+        print("Warning: Invalid claims_tree structure, using empty tree")
+        claims_tree = {}
 
     for topic, topic_data in claims_tree.items():
         per_topic_total = 0
@@ -1079,16 +1122,19 @@ def sort_claims_tree(
                             dupe_ids = claim_set[claim_id]
                             for dupe_id in dupe_ids:
                                 if dupe_id not in accounted_for_ids:
-                                    dupe_claim = {
-                                        k: v
-                                        for k, v in subtopic_data["claims"][
-                                            dupe_id
-                                        ].items()
-                                    }
-                                    dupe_claim["duplicated"] = True
-
-                                    # add all duplicates as children of main claim
-                                    clean_claim["duplicates"].append(dupe_claim)
+                                    # Find the claim by ID in the claims list
+                                    dupe_claim = None
+                                    for claim_item in subtopic_data["claims"]:
+                                        if claim_item.get("claimId") == dupe_id:
+                                            dupe_claim = {k: v for k, v in claim_item.items()}
+                                            break
+                                    
+                                    if dupe_claim:
+                                        dupe_claim["duplicated"] = True
+                                        # add all duplicates as children of main claim
+                                        clean_claim["duplicates"].append(dupe_claim)
+                                    else:
+                                        print(f"Warning: Could not find duplicate claim with ID {dupe_id}")
 
                                     accounted_for_ids[dupe_id] = 1
 
@@ -1300,8 +1346,9 @@ def cruxes_for_topic(
     # Para Ollama, modificar prompts para asegurar salida JSON
     system_prompt = llm.system_prompt
     if ollama_config.should_use_ollama():
-        system_prompt += "\n\nIMPORTANT: You must respond ONLY with valid JSON. No explanations, no additional text."
-        full_prompt += "\n\nRespond with valid JSON containing the crux analysis."
+        # Prompts optimizados para Llama3.2
+        system_prompt = "You are a JSON generator. You MUST respond with ONLY valid JSON. No text before or after the JSON."
+        full_prompt += f"\n\n<JSON_OUTPUT_REQUIRED>\nAnalyze cruxes and respond with valid JSON in this EXACT format:\n{{\n  \"crux\": {{\n    \"cruxClaim\": \"string\",\n    \"agree\": [\"speaker_list\"],\n    \"disagree\": [\"speaker_list\"],\n    \"explanation\": \"string\"\n  }}\n}}\n</JSON_OUTPUT_REQUIRED>"
 
     # Preparar argumentos para la llamada
     call_args = {
@@ -1313,8 +1360,12 @@ def cruxes_for_topic(
         "temperature": 0.0,
     }
     
-    # Solo agregar response_format para OpenAI (Ollama no lo soporta nativamente)
-    if not ollama_config.should_use_ollama():
+    # Configuraciones específicas según el backend
+    if ollama_config.should_use_ollama():
+        # Para Ollama: deshabilitar thinking para mayor velocidad
+        call_args["think"] = False
+    else:
+        # Para OpenAI: usar response_format JSON
         call_args["response_format"] = {"type": "json_object"}
     
     response = client.chat.completions.create(**call_args)
@@ -1324,7 +1375,11 @@ def cruxes_for_topic(
         
         # Usar la función de extracción mejorada para cruxes también
         crux_obj = extract_json_from_response(content)
-        print(f"Successfully parsed crux JSON: {crux_obj}")
+        # Verificar estructura básica para crux
+        if not isinstance(crux_obj, dict):
+            print(f"Unexpected crux structure: type {type(crux_obj)}")
+            crux_obj = {"crux": {"cruxClaim": "", "agree": [], "disagree": [], "explanation": ""}}
+        print(f"Successfully parsed crux JSON with keys: {list(crux_obj.keys())}")
         
     except Exception as e:
         print("Crux parse error:", str(e))
@@ -1401,10 +1456,22 @@ def cruxes_from_tree(
                 print("warning: no crux response from LLM")
                 continue
             try:
-                crux = llm_response["crux"]["crux"]
+                # Manejar estructura de crux correctamente
+                crux_data = llm_response["crux"]
+                if isinstance(crux_data, dict) and "crux" in crux_data:
+                    # Estructura anidada {"crux": {"crux": {...}}}
+                    crux = crux_data["crux"]
+                elif isinstance(crux_data, dict) and "cruxClaim" in crux_data:
+                    # Estructura directa {"cruxClaim": "...", "agree": [...], ...}
+                    crux = crux_data
+                else:
+                    # Estructura no reconocida
+                    print(f"Unexpected crux structure: {crux_data}")
+                    continue
+                    
                 usage = llm_response["usage"]
-            except Exception:
-                print("warning: crux response parsing failed")
+            except Exception as e:
+                print(f"warning: crux response parsing failed: {str(e)}")
                 continue
 
             ids_to_speakers = {v: k for k, v in speaker_map.items()}

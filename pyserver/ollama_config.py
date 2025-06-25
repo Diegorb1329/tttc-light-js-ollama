@@ -10,17 +10,17 @@ load_dotenv()
 
 # Configuración de Ollama
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "qwen3:8b")
+OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "llama3.2:latest")
 
 # Flag para usar Ollama en lugar de OpenAI
 USE_OLLAMA = os.getenv("USE_OLLAMA", "true").lower() == "true"
 
 # Mapeo de modelos OpenAI a Ollama (para compatibilidad)
 MODEL_MAPPING = {
-    "gpt-4o-mini": "qwen3:8b",
-    "gpt-4-turbo-preview": "qwen3:8b", 
-    "gpt-4o": "qwen3:8b",
-    "gpt-3.5-turbo": "qwen3:8b",
+    "gpt-4o-mini": "llama3.2:latest",
+    "gpt-4-turbo-preview": "llama3.2:latest", 
+    "gpt-4o": "llama3.2:latest",
+    "gpt-3.5-turbo": "llama3.2:latest",
     # Agregar más mapeos según sea necesario
 }
 

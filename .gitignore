@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 google-credentials.json
 .env*
+.env.local
 .vscode/
 .next
 dist
