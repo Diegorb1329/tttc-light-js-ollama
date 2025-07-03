@@ -456,7 +456,20 @@ def all_comments_to_claims(
 
     node_counts = {}
     # TODO: batch this so we're not sending the tree each time
+    total_comments = len(req.comments)
+    
     for i_c, comment in enumerate(req.comments):
+        # Show progress for each comment being processed
+        progress_msg = f">>> [PYSERVER] Processing comment {i_c + 1}/{total_comments}"
+        if hasattr(comment, 'speaker') and comment.speaker:
+            progress_msg += f" (speaker: {comment.speaker})"
+        if len(comment.text) > 60:
+            preview = comment.text[:60] + "..."
+        else:
+            preview = comment.text
+        progress_msg += f" - '{preview}'"
+        print(progress_msg)
+        
         # TODO: timing for comments
         # print("comment: ", i_c)
         # print("time: ", datetime.now())
@@ -469,6 +482,16 @@ def all_comments_to_claims(
             claims = response["claims"]
             for claim in claims["claims"]:
                 claim.update({"commentId": comment.id, "speaker": comment.speaker})
+            
+            # Show what claims were extracted
+            if claims and len(claims["claims"]) > 0:
+                print(f"    → Extracted {len(claims['claims'])} claim(s)")
+                for claim in claims["claims"]:
+                    if "topicName" in claim and "subtopicName" in claim:
+                        print(f"      • {claim['topicName']} → {claim['subtopicName']}: {claim['claim'][:80]}{'...' if len(claim['claim']) > 80 else ''}")
+            else:
+                print(f"    → No claims extracted")
+                
         except Exception:
             print("Step 2: no claims for comment: ", response)
             claims = None
@@ -872,18 +895,27 @@ def sort_claims_tree(
     dupe_logs = []
     sorted_tree = {}
 
-    for topic, topic_data in claims_tree.items():
+    # Get total counts for progress tracking
+    total_topics = len(claims_tree)
+    total_subtopics = sum(len(topic_data["subtopics"]) for topic_data in claims_tree.values())
+    current_subtopic = 0
+    
+    for topic_idx, (topic, topic_data) in enumerate(claims_tree.items()):
+        print(f">>> [PYSERVER] Processing topic {topic_idx + 1}/{total_topics}: '{topic}'")
         per_topic_total = 0
         per_topic_list = {}
         # consider the empty top-level topic
         if not topic_data["subtopics"]:
             print("NO SUBTOPICS: ", topic)
         for subtopic, subtopic_data in topic_data["subtopics"].items():
+            current_subtopic += 1
+            print(f"    → Processing subtopic {current_subtopic}/{total_subtopics}: '{subtopic}' ({subtopic_data['total']} claims)")
             per_topic_total += subtopic_data["total"]
             per_topic_speakers = set()
             # canonical order of claims: as they appear in subtopic_data["claims"]
             # no need to deduplicate single claims
             if subtopic_data["total"] > 1:
+                print(f"        ↳ Deduplicating {subtopic_data['total']} claims...")
                 try:
                     response = dedup_claims(subtopic_data["claims"], llm=llm, api_key=x_openai_api_key)
                 except Exception:
@@ -906,7 +938,7 @@ def sort_claims_tree(
                     # implementation notes:
                     # - MOST claims should NOT be near-duplicates
                     # - nesting where |claim_vals| > 0 should be a smaller set than |subtopic_data["claims"]|
-                    # - but also we won't have duplicate info bidirectionally — A may be dupe of B, but B not dupe of A
+                    # - but also we won't have duplicate info bidirectionally — A may be dupe of B, but B not dupe of A
                     for claim_key, claim_vals in deduped["nesting"].items():
                         # this claim_key has some duplicates
                         if len(claim_vals) > 0:
@@ -973,6 +1005,10 @@ def sort_claims_tree(
                 sorted_deduped_claims = sorted(
                     deduped_claims, key=lambda x: len(x["duplicates"]), reverse=True,
                 )
+                
+                # Show deduplication results
+                total_duplicates = sum(len(claim["duplicates"]) for claim in sorted_deduped_claims)
+                print(f"        ✓ Found {total_duplicates} duplicates, final claims: {len(sorted_deduped_claims)}")
                 if log_to_wandb:
                     dupe_logs.append(
                         [
@@ -985,6 +1021,7 @@ def sort_claims_tree(
                 TK_IN += usage.prompt_tokens
                 TK_OUT += usage.completion_tokens
             else:
+                print(f"        ↳ Single claim, no deduplication needed")
                 sorted_deduped_claims = subtopic_data["claims"]
                 # there may be one unique claim or no claims if this is an empty subtopic
                 if subtopic_data["claims"]:
