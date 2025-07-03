@@ -20,7 +20,7 @@ if (process.env.NODE_ENV === "production") {
   // Could be its own env var, but correct for now.
   app.set("trust proxy", 1);
 }
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: `${env.MAX_REQUEST_SIZE_MB}mb` }));
 app.use(express.static("public"));
 
 // Adds context middleware - lets us pass things like env variables

@@ -47,3 +47,36 @@ export function formatData(data: any): SourceRow[] {
     return res;
   });
 }
+
+/**
+ * Determines the correct API key to send to PyServer based on environment configuration.
+ * This ensures compatibility with PyServer's OpenAI/OpenRouter detection logic.
+ * 
+ * Logic:
+ * - If OPENAI_API_BASE_URL is set to OpenRouter endpoint, use OPENROUTER_API_KEY or fallback to OPENAI_API_KEY
+ * - Otherwise, use OPENAI_API_KEY (standard OpenAI)
+ */
+export function getApiKeyForPyServer(env: {
+  OPENAI_API_KEY?: string;
+  OPENROUTER_API_KEY?: string;
+  OPENAI_API_BASE_URL?: string;
+}): string {
+  const isOpenRouter = env.OPENAI_API_BASE_URL?.includes('openrouter.ai');
+  
+  if (isOpenRouter) {
+    // When using OpenRouter, prefer OPENROUTER_API_KEY, fallback to OPENAI_API_KEY
+    const apiKey = env.OPENROUTER_API_KEY || env.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error("OPENROUTER_API_KEY or OPENAI_API_KEY must be provided when using OpenRouter");
+    }
+    console.log(">>> [EXPRESS-SERVER] Using OpenRouter API key for PyServer");
+    return apiKey;
+  } else {
+    // When using OpenAI directly
+    if (!env.OPENAI_API_KEY) {
+      throw new Error("OPENAI_API_KEY must be provided when using OpenAI directly");
+    }
+    console.log(">>> [EXPRESS-SERVER] Using OpenAI API key for PyServer");
+    return env.OPENAI_API_KEY;
+  }
+}

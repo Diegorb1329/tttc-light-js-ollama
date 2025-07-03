@@ -1,14 +1,38 @@
 #! usr/bin/env python
+import os
 
-# DEV MODE DRY RUN: 
+# DEV MODE DRY RUN:
 # - faster & cheaper testing
 # - set this to True to skip OpenAI calls/paying for external LLMs
 # - returns a fixed string in the correct shape for all pyserver routes
 # which would typically call OpenAI
 DRY_RUN = False
 
+# --- OpenRouter/Custom LLM Configuration ---
+# Set OPENAI_API_BASE_URL to use a custom provider like OpenRouter.
+# If set, OPENROUTER_API_KEY will be used for authentication.
+# Docs: https://openrouter.ai/docs/quick-start
+OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", None)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", None)
+
+# Optional: A comma-separated list of models for OpenRouter to route to.
+# Example: "google/gemini-flash-1.5,anthropic/claude-3-haiku"
+# Docs: https://openrouter.ai/docs/routing
+OPENROUTER_MODELS = os.getenv("OPENROUTER_MODELS", None)
+
+# Optional: A comma-separated list of transformations.
+# Example: "middle-out" to remove <thinking> tags from models like Claude.
+# Docs: https://openrouter.ai/docs/transforms
+OPENROUTER_TRANSFORMS = os.getenv("OPENROUTER_TRANSFORMS", None)
+
+# --- Structured Outputs Configuration ---
+# Enable structured outputs for better JSON parsing reliability.
+# Both OpenAI and OpenRouter support this feature.
+# Set to False to use basic json_object format for compatibility.
+USE_STRUCTURED_OUTPUTS = os.getenv("USE_STRUCTURED_OUTPUTS", "true").lower() == "true"
+
 # cheapest for testing
-MODEL = "gpt-4o-mini"  # prod default: "gpt-4-turbo-preview"
+MODEL = "google/gemini-2.0-flash-exp:free"  # prod default: "gpt-4-turbo-preview"
 
 COST_BY_MODEL = {
     # GPT-4o mini: Input is $0.150 / 1M tokens, Output is $0.600 / 1M tokens
@@ -17,6 +41,9 @@ COST_BY_MODEL = {
     # GPT-4o : Input is $2.50 / 1M tokens, Output is $10.00/1M tokens
     # or: input is $0.0025/1K tokens, output is $0.01/1K tokens
     "gpt-4o": {"in_per_1K": 0.0025, "out_per_1K": 0.01},
+    # Placeholder for Gemini Flash - costs on OpenRouter can vary.
+    "google/gemini-flash-1.5:free": {"in_per_1K": 0.0, "out_per_1K": 0.0},
+    "google/gemini-2.5-flash": {"in_per_1K": 0.0, "out_per_1K": 0.0},
 }
 
 # for web-app mode, require at least 3 words in order to extract meaningful claims
@@ -101,21 +128,26 @@ Return a JSON object of the form {
 And now, here are the claims:"""
 
 CRUX_PROMPT = """
-I'm going to give you a topic with a description and a list of high-level claims about this topic made by different participants,
-identified by pseudonyms like "Person 1" or "A". Please synthesize these claims into one new, specific, maximally controversial
-statement called a "cruxClaim". This cruxClaim should divide the participants into "agree" and "disagree" groups or sides,
-based on all their statements on this topic: one group which would agree with the statement, and one which would disagree.
-Please explain your reasoning and assign participants into "agree" and "disagree" groups.
-Make the cruxClaim as precise and unique as possible to the given topic and comments, and pick a cruxClaim that best balances the
-"agree" and "disagree" sides, with close to the same number of participants on each side.
+You are a data processing API. Your sole function is to receive a topic and a list of claims and return a single, valid JSON object.
 
-return a JSON object of the form
+TASK:
+Given a topic, its description, and a list of claims from different participants, synthesize a single, specific, and maximally controversial statement called a "cruxClaim".
+This cruxClaim should be designed to divide the participants into two distinct groups: those who would agree and those who would disagree.
+Assign each participant to one of these groups and provide a brief explanation for your reasoning. Aim for a cruxClaim that balances the number of participants on each side as evenly as possible.
+
+RULES:
+1. Your entire response MUST be a single, valid JSON object.
+2. Do NOT include any introductory text, concluding remarks, or markdown formatting like ```json.
+3. The participant identifiers in the "agree" and "disagree" lists must be the exact same identifiers provided in the input claims.
+
+OUTPUT FORMAT:
+Return a JSON object with the following exact structure:
 {
-  "crux" : {
-    "cruxClaim" : string // the new extracted claim
-    "agree" : list of strings // list of the given participants who would agree with the cruxClaim
-    "disagree" : list strings // list of the given participants who would disagree with the cruxClaim
-    "explanation" : string // reasoning for why you synthesized this cruxClaim from the participants' perspective
+  "crux": {
+    "cruxClaim": "string",
+    "agree": ["list of participant IDs"],
+    "disagree": ["list of participant IDs"],
+    "explanation": "string"
   }
 }
 """

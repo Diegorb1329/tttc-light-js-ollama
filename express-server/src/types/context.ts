@@ -23,7 +23,11 @@ class EnvValidationError extends Error {
 }
 
 export const env = z.object({
-  OPENAI_API_KEY: z.string({ required_error: "Missing OpenAI Key" }),
+  // API Keys - support both OpenAI and OpenRouter
+  OPENAI_API_KEY: z.string().optional(),
+  OPENROUTER_API_KEY: z.string().optional(),
+  OPENAI_API_BASE_URL: z.string().optional(),
+  
   OPENAI_API_KEY_PASSWORD: z
     .string({ invalid_type_error: "Invalid type for openapi key password" })
     .optional(),
@@ -63,7 +67,14 @@ export const env = z.object({
   REDIS_URL: z.string({ required_error: "Missing REDIS_URL" }),
   ALLOWED_GCS_BUCKETS: z.string().transform((val) => val.split(",")),
   REDIS_QUEUE_NAME: z.string().default("pipeline"),
-});
+  MAX_REQUEST_SIZE_MB: z.string().optional().default("50").transform((val) => parseInt(val || "50")),
+}).refine(
+  (data) => data.OPENAI_API_KEY || data.OPENROUTER_API_KEY,
+  {
+    message: "Either OPENAI_API_KEY or OPENROUTER_API_KEY must be provided",
+    path: ["OPENAI_API_KEY"], // This will show the error on OPENAI_API_KEY field
+  }
+);
 
 export type Env = z.infer<typeof env>;
 

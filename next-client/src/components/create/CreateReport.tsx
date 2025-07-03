@@ -275,7 +275,7 @@ const FormHeader = () => (
           exact URL (we’re adding password-protected & private reports soon).
         </li>
         <li>
-          Dataset uploads are limited to 100KB &ndash; but we pay the OpenAI
+          Dataset uploads are limited to {process.env.NEXT_PUBLIC_MAX_FILE_SIZE_MB || "10"}MB &ndash; but we pay the OpenAI
           analysis costs
         </li>
         <li>
@@ -409,7 +409,7 @@ function FormDataInput({
         const description =
           result[1].tag === "Broken file"
             ? "File is broken or has no data"
-            : "File is too large - 150kb limit";
+            : result[1].message || `File is too large - ${process.env.NEXT_PUBLIC_MAX_FILE_SIZE_MB || "10"}MB limit`;
         toast.error("Error", {
           description: description,
           position: "top-center",

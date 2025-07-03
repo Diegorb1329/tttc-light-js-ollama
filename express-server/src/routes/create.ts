@@ -11,6 +11,7 @@ import { DecodedIdToken } from "firebase-admin/auth";
 import { PipelineJob } from "src/jobs/pipeline";
 import { sendError } from "./sendError";
 import { Result } from "../types/result";
+import { DEFAULT_LLM_MODEL } from "../config";
 
 class CreateReportError extends Error {
   constructor(message: string) {
@@ -102,11 +103,11 @@ async function createNewReport(
 
   const storage = createStorage(env);
 
-  // ! Temporary size check
-  // TODO: configure devprod filesize flag
+  // Size check based on configuration
   const datastr = JSON.stringify(data);
-  if (datastr.length > 150 * 1024) {
-    throw new Error("Data too big - limit of 150kb for alpha");
+  const maxSizeBytes = env.MAX_REQUEST_SIZE_MB * 1024 * 1024; // Convert MB to bytes
+  if (datastr.length > maxSizeBytes) {
+    throw new Error(`Data too big - limit of ${env.MAX_REQUEST_SIZE_MB}MB`);
   }
   const _parsedData = await parseData(data);
   const makeAnonName = useAnonymousNames(
@@ -204,7 +205,7 @@ async function createNewReport(
         cruxes: updatedConfig.cruxesEnabled,
       },
       llm: {
-        model: "gpt-4o-mini", // ! Change when we allow different models
+        model: DEFAULT_LLM_MODEL, // ! Change when we allow different models
       },
     },
     data: updatedConfig.data,
@@ -212,6 +213,8 @@ async function createNewReport(
       ...updatedConfig,
     },
   };
+
+  console.log(">>> [EXPRESS-SERVER] Pipeline Job Created with Model:", pipelineJob.config.llm.model);
 
   return {
     tag: "success",

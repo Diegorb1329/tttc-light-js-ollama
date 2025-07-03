@@ -33,7 +33,9 @@ from pydantic import BaseModel
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir))
 import config
-from utils import cute_print, full_speaker_map, token_cost, topic_desc_map, comment_is_meaningful
+from utils import get_openai_client, build_extra_body, cute_print, full_speaker_map, token_cost, topic_desc_map, comment_is_meaningful
+from schemas import get_structured_response_format
+
 
 load_dotenv()
 
@@ -175,8 +177,10 @@ def comments_to_tree(
     if dry_run or config.DRY_RUN:
         print("dry_run topic tree")
         return config.MOCK_RESPONSE["topic_tree"]
-    # api_key = req.llm.api_key
-    client = OpenAI(api_key=x_openai_api_key)
+    
+    # Use flexible OpenAI client that supports both OpenAI and OpenRouter
+    client = get_openai_client(x_openai_api_key)
+    extra_body = build_extra_body()
 
     # append comments to prompt
     full_prompt = req.llm.user_prompt
@@ -187,15 +191,22 @@ def comments_to_tree(
         else:
             print("warning:empty comment in topic_tree:" + comment.text)
 
-    response = client.chat.completions.create(
-        model=req.llm.model_name,
-        messages=[
+    # Prepare parameters for the API call
+    params = {
+        "model": req.llm.model_name,
+        "messages": [
             {"role": "system", "content": req.llm.system_prompt},
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.0,
+        "response_format": get_structured_response_format("topic_tree", config.USE_STRUCTURED_OUTPUTS),
+    }
+    
+    # Add extra_body only if using OpenRouter
+    if extra_body:
+        params["extra_body"] = extra_body
+
+    response = client.chat.completions.create(**params)
     try:
         tree = json.loads(response.choices[0].message.content)
     except Exception:
@@ -270,7 +281,9 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
     Returns:
         dict: A dictionary containing the extracted claims and usage information.
     """
-    client = OpenAI(api_key=api_key)
+    # Use flexible OpenAI client that supports both OpenAI and OpenRouter
+    client = get_openai_client(api_key)
+    extra_body = build_extra_body()
 
     # add taxonomy and comment to prompt template
     taxonomy_string = json.dumps(tree)
@@ -281,18 +294,25 @@ def comment_to_claims(llm: dict, comment: str, tree: dict, api_key: str) -> dict
         "\n" + taxonomy_string + "\nAnd then here is the comment:\n" + comment
     )
 
-    response = client.chat.completions.create(
-        model=llm.model_name,
-        messages=[
+    # Prepare parameters for the API call
+    params = {
+        "model": llm.model_name,
+        "messages": [
             {
                 "role": "system",
                 "content": llm.system_prompt,
             },
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.0,
+        "response_format": get_structured_response_format("claims", config.USE_STRUCTURED_OUTPUTS),
+    }
+    
+    # Add extra_body only if using OpenRouter
+    if extra_body:
+        params["extra_body"] = extra_body
+
+    response = client.chat.completions.create(**params)
     try:
         claims = response.choices[0].message.content
     except Exception:
@@ -590,22 +610,31 @@ def dedup_claims(claims: list, llm: LLMConfig, api_key: str) -> dict:
     Returns:  
         dict: A dictionary containing the deduplicated claims and usage information.  
     """
-    client = OpenAI(api_key=api_key)
+    # Use flexible OpenAI client that supports both OpenAI and OpenRouter
+    client = get_openai_client(api_key)
+    extra_body = build_extra_body()
 
     # add claims with enumerated ids (relative to this subtopic only)
     full_prompt = llm.user_prompt
     for i, orig_claim in enumerate(claims):
         full_prompt += "\nclaimId" + str(i) + ": " + orig_claim["claim"]
 
-    response = client.chat.completions.create(
-        model=config.MODEL,
-        messages=[
+    # Prepare parameters for the API call
+    params = {
+        "model": llm.model_name,
+        "messages": [
             {"role": "system", "content": llm.system_prompt},
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
+        "temperature": 0.0,
+        "response_format": get_structured_response_format("dedup", config.USE_STRUCTURED_OUTPUTS),
+    }
+    
+    # Add extra_body only if using OpenRouter
+    if extra_body:
+        params["extra_body"] = extra_body
+
+    response = client.chat.completions.create(**params)
     try:
         deduped_claims = response.choices[0].message.content
     except Exception:
@@ -1120,7 +1149,8 @@ def cruxes_for_topic(
     on this topic (ideally into two groups of equal size for agreement vs disagreement with the crux claim).
     Requires an explicit API key in api_key.
     """
-    client = OpenAI(api_key=api_key)
+    client = get_openai_client(api_key)
+    extra_body = build_extra_body()
     claims_anon = []
     speaker_set = set()
     for claim in claims:
@@ -1139,20 +1169,29 @@ def cruxes_for_topic(
     full_prompt += "\nTopic: " + topic + ": " + topic_desc
     full_prompt += "\nParticipant claims: \n" + json.dumps(claims_anon)
 
-    response = client.chat.completions.create(
-        model=llm.model_name,
-        messages=[
+    params = {
+        "model": llm.model_name,
+        "messages": [
             {"role": "system", "content": llm.system_prompt},
             {"role": "user", "content": full_prompt},
         ],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-    )
-    crux = response.choices[0].message.content
+        "temperature": 0.0,
+        "response_format": get_structured_response_format("crux", config.USE_STRUCTURED_OUTPUTS),
+    }
+    if extra_body:
+        params["extra_body"] = extra_body
+
+    response = client.chat.completions.create(**params)
+
     try:
+        crux = response.choices[0].message.content
         crux_obj = json.loads(crux)
-    except JSONDecodeError:
-        crux_obj = crux
+    except (JSONDecodeError, TypeError):
+        print(f"Warning: Crux response was not valid JSON. Response: {response}")
+        crux_obj = {}
+    except Exception:
+        print("Step 4: no crux response: ", response)
+        crux_obj = {}
     return {"crux": crux_obj, "usage": response.usage}
 
 
@@ -1221,14 +1260,11 @@ def cruxes_from_tree(
                 req.llm, topic_title, subtopic_desc, claims, speaker_map, x_openai_api_key,
             )
             if not llm_response:
-                print("warning: no crux response from LLM")
+                print(f"Skipping crux for subtopic '{subtopic}' due to invalid LLM response.")
                 continue
-            try:
-                crux = llm_response["crux"]["crux"]
-                usage = llm_response["usage"]
-            except Exception:
-                print("warning: crux response parsing failed")
-                continue
+            
+            crux = llm_response["crux"]["crux"]
+            usage = llm_response["usage"]
 
             ids_to_speakers = {v: k for k, v in speaker_map.items()}
             spoken_claims = [c["speaker"] + ": " + c["claim"] for c in claims]
@@ -1237,10 +1273,7 @@ def cruxes_from_tree(
             crux_claim = crux["cruxClaim"]
             agree = crux["agree"]
             disagree = crux["disagree"]
-            try:
-                explanation = crux["explanation"]
-            except Exception:
-                explanation = "N/A"
+            explanation = crux["explanation"]
 
             # let's add back the names to the sanitized/speaker-ids-only
             # in the agree/disagree claims

@@ -5,6 +5,7 @@ import { Client, Dispatcher } from "undici";
 import { AbortController } from "abort-controller"; // If needed in your environment
 import { TimeoutError, FetchError, InvalidResponseDataError } from "./errors";
 import { flatMapResult, Result } from "../types/result";
+import { getApiKeyForPyServer } from "../utils";
 
 /**
  * Sends an http request to the pyserver for the claims step
@@ -48,7 +49,7 @@ export async function claimsPipelineStep(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          [apiPyserver.OPENAI_API_KEY_HEADER]: env.OPENAI_API_KEY,
+          [apiPyserver.OPENAI_API_KEY_HEADER]: getApiKeyForPyServer(env),
         },
         body: JSON.stringify(input),
       })

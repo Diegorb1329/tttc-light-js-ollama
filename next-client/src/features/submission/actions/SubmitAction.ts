@@ -66,8 +66,19 @@ export default async function submitAction(
     },
   });
   if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.error);
+    try {
+      const errorData = await response.json();
+      // Handle different error formats
+      const errorMessage = typeof errorData.error === 'string' 
+        ? errorData.error 
+        : errorData.message 
+        || JSON.stringify(errorData) 
+        || `HTTP ${response.status}: ${response.statusText}`;
+      throw new Error(errorMessage);
+    } catch (parseError) {
+      // If JSON parsing fails, use status text
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
   }
   return await response.json();
 }

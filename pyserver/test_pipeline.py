@@ -4,8 +4,12 @@ from fastapi.testclient import TestClient
 from main import app
 import config
 import os
+from dotenv import load_dotenv
 
-import visualize as vz
+# Load environment variables
+load_dotenv()
+
+# import visualize as vz
 
 ##################
 # Sample inputs  #
@@ -53,9 +57,9 @@ fancy_scifi_15 = [{"text" : "More epic fantasy worlds","speaker" : "Alice","id":
 ]
 
 # NOTE: gpt-4o-mini is cheaper/better for basic tests, but it fails on some very basic deduplication
-API_KEY = os.getenv('OPENAI_API_KEY')
+API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('OPENAI_API_KEY')
 base_llm = {
-  "model_name" : "gpt-4o-mini",
+  "model_name" : "google/gemini-2.5-flash",
   "system_prompt": config.SYSTEM_PROMPT,
   "api_key" : API_KEY
 }
@@ -120,23 +124,38 @@ def test_full_pipeline(comments=dupes_pets_5):
   print("Step 1: Topic tree\n\n")
   llm = base_llm
   # fancier model for more precise deduplication
-  llm.update({"model_name" : "gpt-4-turbo-preview"})
+  llm.update({"model_name" : "google/gemini-2.5-flash"})
   llm.update({"user_prompt" : config.COMMENT_TO_TREE_PROMPT})
   request ={"llm" : llm, "comments" : comments} 
-  tree = client.post("/topic_tree/", json=request).json()["data"]
-  json_print(tree)
+  response = client.post("/topic_tree/", json=request, headers={"X-OpenAI-API-Key": API_KEY})
+  print("Response status:", response.status_code)
+  print("Response content:", response.json())
+  if "data" in response.json():
+    tree = response.json()["data"]
+    json_print(tree)
+  else:
+    print("Error: No 'data' field in response")
+    return
 
   print("\n\nStep 2: Claims\n\n")
   llm.update({"user_prompt" : config.COMMENT_TO_CLAIMS_PROMPT})
   request ={"llm" : llm, "comments" : comments, "tree" : {"taxonomy" :tree}}
-  claims = client.post("/claims/", json=request).json()["data"]
-  json_print(claims)
+  response2 = client.post("/claims/", json=request, headers={"X-OpenAI-API-Key": API_KEY})
+  print("Claims Response status:", response2.status_code)
+  print("Claims Response content:", response2.json())
+  if "data" in response2.json():
+    claims = response2.json()["data"]
+    json_print(claims)
+  else:
+    print("Error: No 'data' field in claims response")
+    return
 
   print("\n\nStep 3: Dedup & sort\n\n")
   llm.update({"user_prompt" : config.CLAIM_DEDUP_PROMPT})
   request ={"llm" : llm, "tree" : claims , "sort" : "numPeople"}
-  full_tree = client.put("/sort_claims_tree/", json=request)
-  print(json.dumps(full_tree.json(), indent=4))
+  response3 = client.put("/sort_claims_tree/", json=request, headers={"X-OpenAI-API-Key": API_KEY})
+  print("Sort Response status:", response3.status_code)
+  print("Sort Response content:", json.dumps(response3.json(), indent=4))
 
 #################
 # W&B log tests #

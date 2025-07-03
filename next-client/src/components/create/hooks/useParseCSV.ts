@@ -57,10 +57,16 @@ type CSVErrors = z.infer<typeof CsvErrors>;
  */
 const sizeCheck = (buffer: ArrayBuffer): ArrayBuffer | SizeError => {
   const kiloByte = 1024;
-  // TODO: configure devprod filesize flag
-  const maxSize = 150 * kiloByte;
+  const megaByte = kiloByte * 1024;
+  // Get max file size from environment variable, default to 10MB
+  const maxSizeMB = parseInt(process.env.NEXT_PUBLIC_MAX_FILE_SIZE_MB || "10");
+  const maxSize = maxSizeMB * megaByte;
+  
   if (buffer.byteLength > maxSize) {
-    return sizeError.parse({ tag: "Size Error" });
+    return sizeError.parse({ 
+      tag: "Size Error", 
+      message: `File size exceeds ${maxSizeMB}MB limit` 
+    });
   } else {
     return buffer;
   }
